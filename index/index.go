@@ -15,12 +15,14 @@ import (
 type IndexTablesOptions struct {
 	Database sql.Database
 	Tables   []sql.Table
-	Monitor  timings.Monitor
 	Logger   *log.Logger
+	Timings bool
 }
 
 func IndexTables(ctx context.Context, opts *IndexTablesOptions, iterator_uri string, to_iterate ...string) error {
 
+	var monitor timings.Monitor
+	
 	iter_cb := func(ctx context.Context, path string, r io.ReadSeeker, args ...interface{}) error {
 
 		_, uri_args, err := uri.ParseURI(path)
@@ -50,19 +52,33 @@ func IndexTables(ctx context.Context, opts *IndexTablesOptions, iterator_uri str
 			return fmt.Errorf("Failed to index %s, %w", path, err)
 		}
 
-		go opts.Monitor.Signal(ctx)
+		if opts.Timings {
+			go monitor.Signal(ctx)
+		}
+		
 		return nil
 	}
-
+	
 	iter, err := iterator.NewIterator(ctx, iterator_uri, iter_cb)
 
 	if err != nil {
 		return fmt.Errorf("Failed to create new iterator because: %s", err)
 	}
 
-	opts.Monitor.Start(ctx, os.Stdout)
-	defer opts.Monitor.Stop(ctx)
+	if opts.Timings {
+		
+		m, err := timings.NewMonitor(ctx, "counter://PT60S")
+		
+		if err != nil {
+			return fmt.Errorf("Failed to create timings monitor, %w", err)
+		}
 
+		monitor = m
+		
+		monitor.Start(ctx, os.Stdout)
+		defer monitor.Stop(ctx)
+	}
+	
 	err = iter.IterateURIs(ctx, to_iterate...)
 
 	if err != nil {
