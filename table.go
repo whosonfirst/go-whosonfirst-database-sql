@@ -23,9 +23,26 @@ var table_roster roster.Roster
 // an instance of that table
 type TableInitializationFunc func(ctx context.Context, uri string) (Table, error)
 
+// TableWithDatabaseInitializationFunc is a function defined by individual table package and used to create
+// an instance of that table
+type TableWithDatabaseInitializationFunc func(ctx context.Context, uri string, db Database) (Table, error)
+
 // RegisterTable registers 'scheme' as a key pointing to 'init_func' in an internal lookup table
 // used to create new `Table` instances by the `NewTable` method.
 func RegisterTable(ctx context.Context, scheme string, init_func TableInitializationFunc) error {
+
+	err := ensureTableRoster()
+
+	if err != nil {
+		return err
+	}
+
+	return table_roster.Register(ctx, scheme, init_func)
+}
+
+// RegisterTable registers 'scheme' as a key pointing to 'init_func' in an internal lookup table
+// used to create new `Table` instances by the `NewTable` method.
+func RegisterTableWithDatabase(ctx context.Context, scheme string, init_func TableWithDatabaseInitializationFunc) error {
 
 	err := ensureTableRoster()
 
@@ -74,6 +91,26 @@ func NewTable(ctx context.Context, uri string) (Table, error) {
 
 	init_func := i.(TableInitializationFunc)
 	return init_func(ctx, uri)
+}
+
+func NewTableWithDatabase(ctx context.Context, uri string, db Database) (Table, error) {
+
+	u, err := url.Parse(uri)
+
+	if err != nil {
+		return nil, err
+	}
+
+	scheme := u.Scheme
+
+	i, err := table_roster.Driver(ctx, scheme)
+
+	if err != nil {
+		return nil, err
+	}
+
+	init_func := i.(TableWithDatabaseInitializationFunc)
+	return init_func(ctx, uri, db)
 }
 
 // Schemes returns the list of schemes that have been registered.
