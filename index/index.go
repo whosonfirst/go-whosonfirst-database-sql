@@ -3,13 +3,14 @@ package index
 import (
 	"context"
 	"fmt"
-	"github.com/sfomuseum/go-timings"
-	"github.com/whosonfirst/go-whosonfirst-database-sql"
-	"github.com/whosonfirst/go-whosonfirst-iterate/v2/iterator"
-	"github.com/whosonfirst/go-whosonfirst-uri"
 	"io"
 	"log"
 	"os"
+
+	"github.com/sfomuseum/go-timings"
+	"github.com/whosonfirst/go-whosonfirst-database-sql"
+	"github.com/whosonfirst/go-whosonfirst-iterate/v2/iterator"
+	"github.com/whosonfirst/go-whosonfirst-uri"	
 )
 
 type IndexTablesOptions struct {
