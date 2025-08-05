@@ -8,14 +8,17 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/url"
 	"regexp"
 	"runtime"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/whosonfirst/go-whosonfirst-iterate/v2/emitter"
+	"github.com/whosonfirst/go-whosonfirst-uri"
 )
 
 // type Iterator provides a struct that can be used for iterating over a collection of records
@@ -35,7 +38,16 @@ type Iterator struct {
 	// max_procs is the number maximum (CPU) processes to used to process documents simultaneously.
 	max_procs int
 	// exclude_paths is a `regexp.Regexp` instance used to test and exclude (if matching) the paths of documents as they are iterated through.
-	exclude_paths *regexp.Regexp
+	exclude_paths     *regexp.Regexp
+	exclude_alt_files bool
+	// ...
+	include_paths *regexp.Regexp
+	max_attempts  int
+	retry_after   int
+	// skip records (specifically their relative URI) that have already been processed
+	dedupe bool
+	// lookup table to track records (specifically their relative URI) that have been processed
+	dedupe_map *sync.Map
 }
 
 // NewIterator() returns a new `Iterator` instance derived from 'emitter_uri' and 'emitter_cb'. The former is expected
@@ -43,6 +55,7 @@ type Iterator struct {
 // implementation of the `emitter.Emitter` interface. The following iterator-specific query parameters are also accepted:
 // * `?_max_procs=` Explicitly set the number maximum processes to use for iterating documents simultaneously. (Default is the value of `runtime.NumCPU()`.)
 // * `?_exclude=` A valid regular expresion used to test and exclude (if matching) the paths of documents as they are iterated through.
+// * `?_dedupe=` A boolean value to track and skip records (specifically their relative URI) that have already been processed.
 func NewIterator(ctx context.Context, emitter_uri string, emitter_cb emitter.EmitterCallbackFunc) (*Iterator, error) {
 
 	idx, err := emitter.NewEmitter(ctx, emitter_uri)
@@ -63,7 +76,11 @@ func NewIterator(ctx context.Context, emitter_uri string, emitter_cb emitter.Emi
 
 	max_procs := runtime.NumCPU()
 
-	if q.Get("_max_procs") != "" {
+	retry := false
+	max_attempts := 1
+	retry_after := 10 // seconds
+
+	if q.Has("_max_procs") {
 
 		max, err := strconv.ParseInt(q.Get("_max_procs"), 10, 64)
 
@@ -74,7 +91,44 @@ func NewIterator(ctx context.Context, emitter_uri string, emitter_cb emitter.Emi
 		max_procs = int(max)
 	}
 
-	logger := log.Default()
+	if q.Has("_retry") {
+
+		v, err := strconv.ParseBool(q.Get("_retry"))
+
+		if err != nil {
+			return nil, fmt.Errorf("Failed to parse '_retry' parameter, %w", err)
+		}
+
+		retry = v
+	}
+
+	if retry {
+
+		if q.Has("_max_retries") {
+
+			v, err := strconv.Atoi(q.Get("_max_retries"))
+
+			if err != nil {
+				return nil, fmt.Errorf("Failed to parse '_max_retries' parameter, %w", err)
+			}
+
+			max_attempts = v
+		}
+
+		if q.Has("_retry_after") {
+
+			v, err := strconv.Atoi(q.Get("_retry_after"))
+
+			if err != nil {
+				return nil, fmt.Errorf("Failed to parse '_retry_after' parameter, %w", err)
+			}
+
+			retry_after = v
+		}
+	}
+
+	slog_logger := slog.Default()
+	logger := slog.NewLogLogger(slog_logger.Handler(), slog.LevelInfo)
 
 	i := Iterator{
 		Emitter:             idx,
@@ -83,9 +137,22 @@ func NewIterator(ctx context.Context, emitter_uri string, emitter_cb emitter.Emi
 		Seen:                0,
 		count:               0,
 		max_procs:           max_procs,
+		max_attempts:        max_attempts,
+		retry_after:         retry_after,
 	}
 
-	if q.Get("_exclude") != "" {
+	if q.Has("_include") {
+
+		re_include, err := regexp.Compile(q.Get("_include"))
+
+		if err != nil {
+			return nil, fmt.Errorf("Failed to parse '_include' parameter, %w", err)
+		}
+
+		i.include_paths = re_include
+	}
+
+	if q.Has("_exclude") {
 
 		re_exclude, err := regexp.Compile(q.Get("_exclude"))
 
@@ -94,6 +161,32 @@ func NewIterator(ctx context.Context, emitter_uri string, emitter_cb emitter.Emi
 		}
 
 		i.exclude_paths = re_exclude
+	}
+
+	if q.Has("_exclude_alt") {
+
+		v, err := strconv.ParseBool(q.Get("_exclude_alt"))
+
+		if err != nil {
+			return nil, fmt.Errorf("Failed to parse '_exclude_alt' parameter, %w", err)
+		}
+
+		i.exclude_alt_files = v
+	}
+
+	if q.Has("_dedupe") {
+
+		v, err := strconv.ParseBool(q.Get("_dedupe"))
+
+		if err != nil {
+			return nil, fmt.Errorf("Failed to parse '_dedupe' parameter, %w", err)
+		}
+
+		if v {
+			i.dedupe = true
+			i.dedupe_map = new(sync.Map)
+		}
+
 	}
 
 	return &i, nil
@@ -117,9 +210,51 @@ func (idx *Iterator) IterateURIs(ctx context.Context, uris ...string) error {
 
 		defer atomic.AddInt64(&idx.Seen, 1)
 
+		if idx.include_paths != nil {
+
+			if !idx.include_paths.MatchString(path) {
+				return nil
+			}
+		}
+
 		if idx.exclude_paths != nil {
 
 			if idx.exclude_paths.MatchString(path) {
+				return nil
+			}
+		}
+
+		if idx.exclude_alt_files {
+
+			is_alt, err := uri.IsAltFile(path)
+
+			if err != nil {
+				return err
+			}
+
+			if is_alt {
+				return nil
+			}
+		}
+
+		if idx.dedupe {
+
+			id, uri_args, err := uri.ParseURI(path)
+
+			if err != nil {
+				return fmt.Errorf("Failed to parse %s, %w", path, err)
+			}
+
+			rel_path, err := uri.Id2RelPath(id, uri_args)
+
+			if err != nil {
+				return fmt.Errorf("Failed to derive relative path for %s, %w", path, err)
+			}
+
+			_, seen := idx.dedupe_map.LoadOrStore(rel_path, true)
+
+			if seen {
+				slog.Debug("Skip record", "path", rel_path)
 				return nil
 			}
 		}
@@ -160,11 +295,37 @@ func (idx *Iterator) IterateURIs(ctx context.Context, uris ...string) error {
 				// pass
 			}
 
-			err := idx.Emitter.WalkURI(ctx, local_callback, uri)
+			var walk_err error
+			attempts := 0
 
-			if err != nil {
-				err_ch <- fmt.Errorf("Failed to walk '%s', %w", uri, err)
+			// slog.Info("Walk", "uri", uri, "max_attempts", idx.max_attempts, "retry after", idx.retry_after)
+
+			for attempts < idx.max_attempts {
+
+				// slog.Info("Walk URI", "uri", uri, "attempts", attempts)
+				walk_err = idx.Emitter.WalkURI(ctx, local_callback, uri)
+
+				if walk_err == nil {
+					break
+				}
+
+				attempts += 1
+
+				if idx.retry_after != 0 && attempts < idx.max_attempts {
+
+					time_to_sleep := idx.retry_after * attempts
+
+					slog.Error("Failed to walk URI, retry after delay", "attempts", attempts, "max_attempts", idx.max_attempts, "uri", uri, "error", walk_err, "seconds", time_to_sleep)
+
+					time.Sleep(time.Duration(time_to_sleep) * time.Second)
+				}
 			}
+
+			if walk_err != nil {
+				slog.Error("Failed to walk URI, triggering error", "uri", uri, "error", walk_err)
+				err_ch <- fmt.Errorf("Failed to walk '%s', %w", uri, walk_err)
+			}
+
 		}(uri)
 	}
 

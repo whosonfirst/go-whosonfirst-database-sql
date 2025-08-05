@@ -4,25 +4,19 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
-	"os"
+	"log/slog"
 
-	"github.com/sfomuseum/go-timings"
 	"github.com/whosonfirst/go-whosonfirst-database-sql"
 	"github.com/whosonfirst/go-whosonfirst-iterate/v2/iterator"
-	"github.com/whosonfirst/go-whosonfirst-uri"	
+	"github.com/whosonfirst/go-whosonfirst-uri"
 )
 
 type IndexTablesOptions struct {
 	Database sql.Database
 	Tables   []sql.Table
-	Logger   *log.Logger
-	Timings  bool
 }
 
 func IndexTables(ctx context.Context, opts *IndexTablesOptions, iterator_uri string, to_iterate ...string) error {
-
-	var monitor timings.Monitor
 
 	iter_cb := func(ctx context.Context, path string, r io.ReadSeeker, args ...interface{}) error {
 
@@ -50,11 +44,10 @@ func IndexTables(ctx context.Context, opts *IndexTablesOptions, iterator_uri str
 		err = opts.Database.IndexFeature(ctx, opts.Tables, body, alt)
 
 		if err != nil {
-			return fmt.Errorf("Failed to index %s, %w", path, err)
-		}
+			slog.Warn("Failed to index feature", "path", path, "error", err)
+			return nil
 
-		if opts.Timings {
-			go monitor.Signal(ctx)
+			// return fmt.Errorf("Failed to index %s, %w", path, err)
 		}
 
 		return nil
@@ -64,20 +57,6 @@ func IndexTables(ctx context.Context, opts *IndexTablesOptions, iterator_uri str
 
 	if err != nil {
 		return fmt.Errorf("Failed to create new iterator because: %s", err)
-	}
-
-	if opts.Timings {
-
-		m, err := timings.NewMonitor(ctx, "counter://PT60S")
-
-		if err != nil {
-			return fmt.Errorf("Failed to create timings monitor, %w", err)
-		}
-
-		monitor = m
-
-		monitor.Start(ctx, os.Stdout)
-		defer monitor.Stop(ctx)
 	}
 
 	err = iter.IterateURIs(ctx, to_iterate...)
